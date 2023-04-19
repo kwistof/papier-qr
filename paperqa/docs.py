@@ -42,6 +42,7 @@ class Docs:
         name: str = "default",
         index_path: Optional[Path] = None,
         embeddings: Optional[Embeddings] = None,
+        asynchronous: bool = True,
     ) -> None:
         """Initialize the collection of documents.
 
@@ -52,6 +53,7 @@ class Docs:
             name: The name of the collection.
             index_path: The path to the index file IF pickled. If None, defaults to using name in $HOME/.paperqa/name
         """
+        self.asynchronous = asynchronous
         self.docs = dict()
         self.chunk_size_limit = chunk_size_limit
         self.keys = set()
@@ -252,15 +254,25 @@ class Docs:
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-        return loop.run_until_complete(
-            self.aget_evidence(
-                answer,
-                k=k,
-                max_sources=max_sources,
-                marginal_relevance=marginal_relevance,
-                key_filter=key_filter,
+        if self.asynchronous:
+            return loop.run_until_complete(
+                self.aget_evidence(
+                    answer,
+                    k=k,
+                    max_sources=max_sources,
+                    marginal_relevance=marginal_relevance,
+                    key_filter=key_filter,
+                )
             )
-        )
+        else:
+            return self.aget_evidence(
+                    answer,
+                    k=k,
+                    max_sources=max_sources,
+                    marginal_relevance=marginal_relevance,
+                    key_filter=key_filter,
+                )
+            
 
     async def aget_evidence(
         self,
@@ -293,14 +305,22 @@ class Docs:
             # check if it is already in answer (possible in agent setting)
             if doc.metadata["key"] in [c.key for c in answer.contexts]:
                 return None
-            c = Context(
-                key=doc.metadata["key"],
-                citation=doc.metadata["citation"],
-                context=await self.summary_chain.arun(
+            if self.asynchronous:
+                context = await self.summary_chain.arun(
                     question=answer.question,
                     context_str=doc.page_content,
                     citation=doc.metadata["citation"],
-                ),
+                )
+            else:
+                context = self.summary_chain.run(
+                    question=answer.question,
+                    context_str=doc.page_content,
+                    citation=doc.metadata["citation"],
+                )
+            c = Context(
+                key=doc.metadata["key"],
+                citation=doc.metadata["citation"],
+                context=context,
                 text=doc.page_content,
             )
             if "Not applicable" not in c.context:
@@ -308,7 +328,10 @@ class Docs:
             return None
 
         with get_openai_callback() as cb:
-            contexts = await asyncio.gather(*[process(doc) for doc in docs])
+            if self.asynchronous:
+                contexts = await asyncio.gather(*[process(doc) for doc in docs])
+            else:
+                contexts = [process(doc) for doc in docs]
         answer.tokens += cb.total_tokens
         answer.cost += cb.total_cost
         contexts = [c for c in contexts if c is not None]
@@ -371,8 +394,20 @@ class Docs:
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-        return loop.run_until_complete(
-            self.aquery(
+        if self.asynchronous:
+            return loop.run_until_complete(
+                self.aquery(
+                    query,
+                    k=k,
+                    max_sources=max_sources,
+                    length_prompt=length_prompt,
+                    marginal_relevance=marginal_relevance,
+                    answer=answer,
+                    key_filter=key_filter,
+                )
+            )
+        else:
+            return self.aquery(
                 query,
                 k=k,
                 max_sources=max_sources,
@@ -381,7 +416,6 @@ class Docs:
                 answer=answer,
                 key_filter=key_filter,
             )
-        )
 
     async def aquery(
         self,
@@ -419,9 +453,14 @@ class Docs:
             )
         else:
             with get_openai_callback() as cb:
-                answer_text = await self.qa_chain.arun(
-                    question=query, context_str=context_str, length=length_prompt
-                )
+                if self.asynchronous:
+                    answer_text = await self.qa_chain.arun(
+                        question=query, context_str=context_str, length=length_prompt
+                    )
+                else:
+                    answer_text = self.qa_chain.run(
+                        question=query, context_str=context_str, length=length_prompt
+                    )
             answer.tokens += cb.total_tokens
             answer.cost += cb.total_cost
         # it still happens lol
