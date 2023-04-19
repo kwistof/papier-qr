@@ -265,7 +265,7 @@ class Docs:
                 )
             )
         else:
-            return self.aget_evidence(
+            return self.sget_evidence(
                     answer,
                     k=k,
                     max_sources=max_sources,
@@ -360,6 +360,81 @@ class Docs:
         answer.context = context_str
         return answer
 
+    def sget_evidence(
+        self,
+        answer: Answer,
+        k: int = 3,
+        max_sources: int = 5,
+        marginal_relevance: bool = True,
+        key_filter: Optional[List[str]] = None,
+    ) -> Answer:
+        if len(self.docs) == 0:
+            return answer
+        if self._faiss_index is None:
+            self._build_faiss_index()
+        _k = k
+        if key_filter is not None:
+            _k = k * 10  # heuristic
+        # want to work through indices but less k
+        if marginal_relevance:
+            docs = self._faiss_index.max_marginal_relevance_search(
+                answer.question, k=_k, fetch_k=5 * _k
+            )
+        else:
+            docs = self._faiss_index.similarity_search(
+                answer.question, k=_k, fetch_k=5 * _k
+            )
+
+        def process(doc):
+            if key_filter is not None and doc.metadata["dockey"] not in key_filter:
+                return None
+            # check if it is already in answer (possible in agent setting)
+            if doc.metadata["key"] in [c.key for c in answer.contexts]:
+                return None
+            c = Context(
+                key=doc.metadata["key"],
+                citation=doc.metadata["citation"],
+                context=self.summary_chain.run(
+                    question=answer.question,
+                    context_str=doc.page_content,
+                    citation=doc.metadata["citation"],
+                    ),
+                text=doc.page_content,
+            )
+            if "Not applicable" not in c.context:
+                return c
+            return None
+
+        with get_openai_callback() as cb:
+            contexts = [process(doc) for doc in docs]
+        answer.tokens += cb.total_tokens
+        answer.cost += cb.total_cost
+        contexts = [c for c in contexts if c is not None]
+        if len(contexts) == 0:
+            return answer
+        contexts = sorted(contexts, key=lambda x: len(x.context), reverse=True)
+        contexts = contexts[:max_sources]
+        # add to answer (if not already there)
+        keys = [c.key for c in answer.contexts]
+        for c in contexts:
+            if c.key not in keys:
+                answer.contexts.append(c)
+
+        context_str = "\n\n".join(
+            [
+                f"{c.key}: {c.context}"
+                for c in answer.contexts
+                if "Not applicable" not in c.context
+            ]
+        )
+        valid_keys = [
+            c.key for c in answer.contexts if "Not applicable" not in c.context
+        ]
+        if len(valid_keys) > 0:
+            context_str += "\n\nValid keys: " + ", ".join(valid_keys)
+        answer.context = context_str
+        return answer
+
     def generate_search_query(self, query: str) -> List[str]:
         """Generate a list of search strings that can be used to find
         relevant papers.
@@ -407,7 +482,7 @@ class Docs:
                 )
             )
         else:
-            return self.aquery(
+            return self.squery(
                 query,
                 k=k,
                 max_sources=max_sources,
@@ -461,6 +536,72 @@ class Docs:
                     answer_text = self.qa_chain.run(
                         question=query, context_str=context_str, length=length_prompt
                     )
+            answer.tokens += cb.total_tokens
+            answer.cost += cb.total_cost
+        # it still happens lol
+        if "(Foo2012)" in answer_text:
+            answer_text = answer_text.replace("(Foo2012)", "")
+        for c in contexts:
+            key = c.key
+            text = c.context
+            citation = c.citation
+            # do check for whole key (so we don't catch Callahan2019a with Callahan2019)
+            skey = key.split(" ")[0]
+            if skey + " " in answer_text or skey + ")" or skey + "," in answer_text:
+                bib[skey] = citation
+                passages[key] = text
+        bib_str = "\n\n".join(
+            [f"{i+1}. ({k}): {c}" for i, (k, c) in enumerate(bib.items())]
+        )
+        formatted_answer = f"Question: {query}\n\n{answer_text}\n"
+        if len(bib) > 0:
+            formatted_answer += f"\nReferences\n\n{bib_str}\n"
+        formatted_answer += f"\nTokens Used: {answer.tokens} Cost: ${answer.cost:.2f}"
+        answer.answer = answer_text
+        answer.formatted_answer = formatted_answer
+        answer.references = bib_str
+        answer.passages = passages
+        return answer
+
+    def squery(
+        self,
+        query: str,
+        k: int = 10,
+        max_sources: int = 5,
+        length_prompt: str = "about 100 words",
+        marginal_relevance: bool = True,
+        answer: Optional[Answer] = None,
+        key_filter: Optional[bool] = None,
+    ) -> Answer:
+        if k < max_sources:
+            raise ValueError("k should be greater than max_sources")
+        if answer is None:
+            answer = Answer(query)
+        if len(answer.contexts) == 0:
+            if key_filter or (key_filter is None and len(self.docs) > 5):
+                with get_openai_callback() as cb:
+                    keys = self.doc_match(answer.question)
+                answer.tokens += cb.total_tokens
+                answer.cost += cb.total_cost
+            answer = self.sget_evidence(
+                answer,
+                k=k,
+                max_sources=max_sources,
+                marginal_relevance=marginal_relevance,
+                key_filter=keys if key_filter else None,
+            )
+        context_str, contexts = answer.context, answer.contexts
+        bib = dict()
+        passages = dict()
+        if len(context_str) < 10:
+            answer_text = (
+                "I cannot answer this question due to insufficient information."
+            )
+        else:
+            with get_openai_callback() as cb:
+                answer_text = self.qa_chain.run(
+                    question=query, context_str=context_str, length=length_prompt
+                )
             answer.tokens += cb.total_tokens
             answer.cost += cb.total_cost
         # it still happens lol
